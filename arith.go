@@ -26,9 +26,22 @@ func scaleCoef(coef *big.Int, shift int) *big.Int {
 	return new(big.Int).Mul(coef, pow10(shift))
 }
 
-// pow10 returns 10**n (n >= 0).
-func pow10(n int) *big.Int {
-	return new(big.Int).Exp(bigTen, big.NewInt(int64(n)), nil)
+// signedScaled returns sign * coef * 10**(d.exp-exp) as a fresh, owned big.Int
+// (exp is the common exponent, never above d.exp). It fuses the scale-to-common
+// exponent and the sign application into a single allocation, where the old
+// alignedCoefs+applySign pair copied the significand and then, for a negative
+// value, allocated a second negated copy.
+func (d *Decimal) signedScaled(exp int) *big.Int {
+	v := new(big.Int)
+	if d.exp == exp {
+		v.Set(d.coef)
+	} else {
+		v.Mul(d.coef, pow10(d.exp-exp))
+	}
+	if d.sign < 0 {
+		v.Neg(v)
+	}
+	return v
 }
 
 // Add returns d + o (BigDecimal#+). Special-value combinations follow MRI:
@@ -37,9 +50,13 @@ func (d *Decimal) Add(o *Decimal) *Decimal {
 	if r, ok := addSpecial(d, o); ok {
 		return r
 	}
-	ca, cb, exp := alignedCoefs(d, o)
-	sum := new(big.Int).Add(d.applySign(ca), o.applySign(cb))
-	return fromSigned(sum, exp)
+	exp := d.exp
+	if o.exp < exp {
+		exp = o.exp
+	}
+	sum := d.signedScaled(exp)
+	sum.Add(sum, o.signedScaled(exp))
+	return fromSignedOwned(sum, exp)
 }
 
 // Sub returns d - o (BigDecimal#-).
@@ -55,14 +72,17 @@ func (d *Decimal) applySign(coef *big.Int) *big.Int {
 	return coef
 }
 
-// fromSigned builds a finite Decimal from a signed magnitude at exponent exp.
-// A zero magnitude normalises to +0 (MRI yields +0.0 for x + (−x)).
-func fromSigned(v *big.Int, exp int) *Decimal {
+// fromSignedOwned builds a finite Decimal from a signed magnitude at exponent exp
+// for a caller that surrenders v: it reads the sign and then folds the magnitude
+// in place (v.Abs(v)) rather than allocating a separate non-negative copy. A zero
+// magnitude normalises to +0 (MRI yields +0.0 for x + (−x)).
+func fromSignedOwned(v *big.Int, exp int) *Decimal {
 	sign := 1
 	if v.Sign() < 0 {
 		sign = -1
 	}
-	return newFinite(sign, new(big.Int).Abs(v), exp)
+	v.Abs(v)
+	return newFiniteOwned(sign, v, exp)
 }
 
 // Neg returns -d (unary minus). A non-NaN value flips sign (including a signed
@@ -92,7 +112,7 @@ func (d *Decimal) Mul(o *Decimal) *Decimal {
 		return r
 	}
 	coef := new(big.Int).Mul(d.coef, o.coef)
-	return newFinite(d.sign*o.sign, coef, d.exp+o.exp)
+	return newFiniteOwned(d.sign*o.sign, coef, d.exp+o.exp)
 }
 
 // addSpecial handles the special-value cases of Add, returning ok == false when

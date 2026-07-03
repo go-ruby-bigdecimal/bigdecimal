@@ -92,7 +92,58 @@ var (
 var (
 	bigTen  = big.NewInt(10)
 	bigZero = big.NewInt(0)
+	// bigOne is a shared, read-only 1 used as an increment/decrement operand
+	// (big.Int.Add/Sub never mutate their inputs), sparing a big.NewInt(1)
+	// allocation on the rounding and division paths.
+	bigOne = big.NewInt(1)
 )
+
+// pow10Cache holds 10**0 … 10**pow10CacheMax, built once at init. pow10 returns
+// the cached, SHARED value for an in-range exponent, so callers MUST treat the
+// result as immutable (read-only): scale/round/divide only ever pass it as a
+// multiplicand, divisor or comparand, never mutate it. Powers of ten dominate
+// every scaling, rounding and division step, so caching them removes the bulk of
+// the per-op math/big.Int.Exp allocation the hot paths used to pay.
+const pow10CacheMax = 512
+
+var pow10Cache [pow10CacheMax + 1]*big.Int
+
+func init() {
+	pow10Cache[0] = big.NewInt(1)
+	for i := 1; i <= pow10CacheMax; i++ {
+		pow10Cache[i] = new(big.Int).Mul(pow10Cache[i-1], bigTen)
+	}
+}
+
+// pow10 returns 10**n (n >= 0). In-range exponents return a shared, immutable
+// cached value; larger ones are computed fresh.
+func pow10(n int) *big.Int {
+	if n >= 0 && n <= pow10CacheMax {
+		return pow10Cache[n]
+	}
+	return new(big.Int).Exp(bigTen, big.NewInt(int64(n)), nil)
+}
+
+// decDigits returns the number of decimal digits in the non-negative integer x
+// (a zero counts as one digit), without allocating the base-ten string that
+// big.Int.Text would. It seeds an upper bound from the bit length — a b-bit
+// integer has at most ⌊b·log10(2)⌋+1 digits — then walks it down against the
+// cached powers of ten, so the result is exact for every magnitude while the
+// common case costs one BitLen and a single (allocation-free) comparison.
+func decDigits(x *big.Int) int {
+	if x.Sign() == 0 {
+		return 1
+	}
+	// 1234/4096 = 0.30127 is strictly greater than log10(2) = 0.30103, so
+	// ⌊bits·1234/4096⌋+1 never under-counts the digits at any magnitude (a lower
+	// coefficient would under-count huge values); the loop then trims that upper
+	// bound — at most a step or two — down to the exact count.
+	n := x.BitLen()*1234>>12 + 1
+	for n > 1 && x.Cmp(pow10(n-1)) < 0 {
+		n--
+	}
+	return n
+}
 
 // nanDecimal / infDecimal build the specials.
 func nanDecimal() *Decimal { return &Decimal{kind: nan, sign: 1, coef: new(big.Int)} }
@@ -100,33 +151,51 @@ func nanDecimal() *Decimal { return &Decimal{kind: nan, sign: 1, coef: new(big.I
 func infDecimal(sign int) *Decimal { return &Decimal{kind: inf, sign: sign, coef: new(big.Int)} }
 
 // newFinite builds a finite Decimal from a magnitude and exponent, then
-// normalises it (strips trailing zero digits, collapses a zero significand).
+// normalises it (strips trailing zero digits, collapses a zero significand). It
+// copies coef, so the caller keeps ownership; a hot-path caller that has a fresh,
+// non-negative magnitude it can surrender should use newFiniteOwned instead.
 func newFinite(sign int, coef *big.Int, exp int) *Decimal {
-	d := &Decimal{kind: finite, sign: sign, coef: new(big.Int).Abs(coef), exp: exp}
+	return newFiniteOwned(sign, new(big.Int).Abs(coef), exp)
+}
+
+// newFiniteOwned is newFinite for a caller that hands over a fresh, non-negative
+// magnitude the constructor may keep and reuse. It avoids newFinite's defensive
+// Abs copy — the single biggest per-op allocation on the add/div/parse paths,
+// each of which already produces exactly such a value.
+func newFiniteOwned(sign int, coef *big.Int, exp int) *Decimal {
+	d := &Decimal{kind: finite, sign: sign, coef: coef, exp: exp}
 	d.normalize()
 	return d
 }
 
 // normalize removes a trailing power of ten from coef (rolling it into exp) so
 // the canonical form is unique, and zeroes the exponent of a zero significand. It
-// is only ever called on a freshly-built finite value (from newFinite).
+// is only ever called on a freshly-built finite value.
+//
+// An odd significand can carry no factor of ten, so the parity check retires the
+// common case with no allocation at all; when zeros must be stripped the two
+// scratch integers are swapped between coef and the quotient so the loop
+// allocates a fixed two words regardless of how many zeros fall away. It never
+// writes through the incoming coef pointer, so a shared cache value would be safe
+// even though callers always pass an owned one.
 func (d *Decimal) normalize() {
 	if d.coef.Sign() == 0 {
 		d.exp = 0
 		return
 	}
-	m := new(big.Int).Abs(d.coef)
+	if d.coef.Bit(0) != 0 {
+		return // odd ⇒ not divisible by ten
+	}
 	q := new(big.Int)
 	r := new(big.Int)
 	for {
-		q.QuoRem(m, bigTen, r)
+		q.QuoRem(d.coef, bigTen, r)
 		if r.Sign() != 0 {
 			break
 		}
-		m.Set(q)
+		d.coef, q = q, d.coef
 		d.exp++
 	}
-	d.coef = m
 }
 
 // clone returns an independent copy.
@@ -156,7 +225,7 @@ func (d *Decimal) IsZero() bool { return d.kind == finite && d.coef.Sign() == 0 
 // a zero significand (its "length" is meaningless), so this is only reached for a
 // non-zero magnitude.
 func (d *Decimal) numDigits() int {
-	return len(d.coef.Text(10))
+	return decDigits(d.coef)
 }
 
 // pointExp is MRI's #exponent: value == 0.<digits> * 10**pointExp, i.e. the
