@@ -37,9 +37,9 @@ func (d *Decimal) DivE(o *Decimal, prec int) (*Decimal, error) {
 	}
 	q, qexp := divDigits(d.coef, o.coef, d.exp-o.exp, want)
 	if q.Sign() == 0 {
-		return newFinite(sign, big.NewInt(0), 0), nil
+		return newFiniteOwned(sign, new(big.Int), 0), nil
 	}
-	return newFinite(sign, q, qexp), nil
+	return newFiniteOwned(sign, q, qexp), nil
 }
 
 // divSpecial handles NaN/∞/zero combinations of division. It returns ok == true
@@ -82,14 +82,17 @@ func divDigits(a, b *big.Int, baseExp, prec int) (q *big.Int, exp int) {
 	// The most-significant digit of a/b sits near power (digits(a)-digits(b)). To
 	// land prec+guard significant digits we scale a by 10**p (p chosen relative to
 	// b's magnitude, independent of baseExp) so floor(a*10**p / b) has that many
-	// digits; the value's exponent is then baseExp - p.
-	p := (prec + guard) - (len(a.Text(10)) - len(b.Text(10)))
-	num := new(big.Int).Set(a)
-	den := new(big.Int).Set(b)
-	if p >= 0 {
-		num.Mul(num, pow10(p))
-	} else {
-		den.Mul(den, pow10(-p))
+	// digits; the value's exponent is then baseExp - p. decDigits counts the
+	// operands without materialising their base-ten strings.
+	p := (prec + guard) - (decDigits(a) - decDigits(b))
+	// Scale only the side that needs it, and leave the other aliasing the operand:
+	// QuoRem reads its dividend and divisor, so no defensive copy is required.
+	num, den := a, b
+	switch {
+	case p > 0:
+		num = new(big.Int).Mul(a, pow10(p))
+	case p < 0:
+		den = new(big.Int).Mul(b, pow10(-p))
 	}
 	q = new(big.Int)
 	r := new(big.Int)
@@ -101,16 +104,16 @@ func divDigits(a, b *big.Int, baseExp, prec int) (q *big.Int, exp int) {
 	if r.Sign() != 0 {
 		twice := new(big.Int).Lsh(r, 1)
 		if twice.Cmp(den) >= 0 {
-			q.Add(q, big.NewInt(1))
+			q.Add(q, bigOne)
 		}
 	}
 	// Trim to exactly prec significant digits, half-up.
-	qd := len(q.Text(10))
+	qd := decDigits(q)
 	if qd > prec {
 		drop := qd - prec
 		q2, up := roundShift(q, drop, RoundHalfUp, 1, false)
 		if up {
-			q2.Add(q2, big.NewInt(1))
+			q2.Add(q2, bigOne)
 		}
 		q = q2
 		qexp += drop
@@ -188,7 +191,7 @@ func flooredDivMod(a, b *big.Int) (q, r *big.Int) {
 	r = new(big.Int)
 	q.QuoRem(a, b, r) // truncated toward zero
 	if r.Sign() != 0 && (r.Sign() < 0) != (b.Sign() < 0) {
-		q.Sub(q, big.NewInt(1))
+		q.Sub(q, bigOne)
 		r.Add(r, b)
 	}
 	return q, r

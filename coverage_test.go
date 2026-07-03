@@ -4,9 +4,61 @@
 
 package bigdecimal
 
-import "testing"
+import (
+	"math/big"
+	"testing"
+)
 
-// TestNegativeSubResult drives the negative-magnitude branch of fromSigned.
+// TestDecDigitsAndPow10 white-box tests the two allocation-avoiding helpers on the
+// hot paths: decDigits must equal big.Int.Text's length for every magnitude —
+// including values just at and just below a power of ten, which exercise both
+// bit-length-estimate correction loops — and pow10 must equal 10**n both inside
+// its cache and past the cache bound.
+func TestDecDigitsAndPow10(t *testing.T) {
+	// A dense sweep across several power-of-ten boundaries forces both estimate
+	// corrections (the seed can land one digit high or low near a power of ten).
+	for i := int64(0); i <= 5000; i++ {
+		x := big.NewInt(i)
+		if got, want := decDigits(x), len(x.Text(10)); got != want {
+			t.Errorf("decDigits(%d) = %d, want %d", i, got, want)
+		}
+	}
+	for _, s := range []string{
+		"999999999999999999", "1000000000000000000",
+		"9999999999999999999999999999", "10000000000000000000000000000",
+	} {
+		x, _ := new(big.Int).SetString(s, 10)
+		if got, want := decDigits(x), len(x.Text(10)); got != want {
+			t.Errorf("decDigits(%s) = %d, want %d", s, got, want)
+		}
+	}
+	for _, n := range []int{0, 1, 18, pow10CacheMax, pow10CacheMax + 1, 700} {
+		want := new(big.Int).Exp(bigTen, big.NewInt(int64(n)), nil)
+		if pow10(n).Cmp(want) != 0 {
+			t.Errorf("pow10(%d) mismatch", n)
+		}
+	}
+}
+
+// TestLargeExponentAdd drives pow10 past its cache bound through the public Add
+// path: aligning operands 600 decades apart scales one significand by 10**600.
+func TestLargeExponentAdd(t *testing.T) {
+	got := mustNew(t, "1e600").Add(mustNew(t, "1")).ToS("F")
+	want := "1" + repeat0(599) + "1.0" // 10**600 + 1
+	if got != want {
+		t.Errorf("1e600 + 1 = %s… (len %d), want len %d", got[:20], len(got), len(want))
+	}
+}
+
+func repeat0(n int) string {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = '0'
+	}
+	return string(b)
+}
+
+// TestNegativeSubResult drives the negative-magnitude branch of fromSignedOwned.
 func TestNegativeSubResult(t *testing.T) {
 	if got := mustNew(t, "0.1").Sub(mustNew(t, "0.2")).String(); got != "-0.1e0" {
 		t.Errorf("0.1-0.2 = %s", got)

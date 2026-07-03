@@ -18,7 +18,7 @@ func (d *Decimal) roundTo(place int, mode RoundMode) *Decimal {
 		return infDecimal(d.sign)
 	}
 	if d.coef.Sign() == 0 {
-		return newFinite(d.sign, big.NewInt(0), 0)
+		return newFiniteOwned(d.sign, new(big.Int), 0)
 	}
 	if d.exp >= place {
 		return d.clone() // already at or above the requested granularity
@@ -26,9 +26,9 @@ func (d *Decimal) roundTo(place int, mode RoundMode) *Decimal {
 	drop := place - d.exp
 	q, up := roundShift(d.coef, drop, mode, d.sign, d.intDropped(place))
 	if up {
-		q.Add(q, big.NewInt(1))
+		q.Add(q, bigOne)
 	}
-	return newFinite(d.sign, q, place)
+	return newFiniteOwned(d.sign, q, place)
 }
 
 // intDropped reports whether ROUND_UP should treat the discarded remainder as
